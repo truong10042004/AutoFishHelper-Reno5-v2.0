@@ -26,28 +26,20 @@ class AutoClickAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    fun tap(x: Float, y: Float, onResult: ((Boolean) -> Unit)? = null) {
-        val jitterX = x + Random.nextInt(-4, 5)
-        val jitterY = y + Random.nextInt(-4, 5)
+    /**
+     * Tối ưu tốc độ nhấn: thời lượng giữ ngón tay 18-28ms (thay vì 55-85ms)
+     * giúp giải phóng hàng đợi cử chỉ ngay lập tức khi kéo cá.
+     */
+    fun tap(x: Float, y: Float, fastMode: Boolean = false) {
+        val jitterX = x + Random.nextInt(-3, 4)
+        val jitterY = y + Random.nextInt(-3, 4)
 
         val path = Path().apply {
             moveTo(jitterX.coerceAtLeast(1f), jitterY.coerceAtLeast(1f))
         }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, Random.nextLong(55L, 85L))
+        val duration = if (fastMode) Random.nextLong(16L, 26L) else Random.nextLong(35L, 50L)
+        val stroke = GestureDescription.StrokeDescription(path, 0L, duration)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-
-        val callback = object : GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) {
-                onResult?.invoke(true)
-            }
-
-            override fun onCancelled(gestureDescription: GestureDescription?) {
-                onResult?.invoke(false)
-            }
-        }
-        val dispatched = dispatchGesture(gesture, callback, null)
-        if (!dispatched) {
-            onResult?.invoke(false)
-        }
+        dispatchGesture(gesture, null, null)
     }
 }

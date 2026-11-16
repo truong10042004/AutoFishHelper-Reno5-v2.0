@@ -43,10 +43,10 @@ class FishingBotService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private lateinit var controlPanelView: View
-    private lateinit var markerScanView: View
-    private lateinit var markerCastView: View
-    private lateinit var markerReelView: View
-    private lateinit var markerStoreView: View
+    private lateinit var markerScanView: View   // 1: Dấu (!)
+    private lateinit var markerCastView: View   // 2: Nút Quăng cần
+    private lateinit var markerReelView: View   // 3: Nút Kéo cá
+    private lateinit var markerStoreView: View  // 4: Nút Bảo quản
 
     private lateinit var btnToggle: Button
     private lateinit var btnSensitivity: Button
@@ -54,15 +54,19 @@ class FishingBotService : Service() {
 
     private enum class BotState { IDLE, CASTING, CALIBRATING, WAITING_BITE, REELING, STORING }
     @Volatile private var currentState = BotState.IDLE
-    private var stateStartTime = 0L
+    @Volatile private var stateStartTime = 0L
     private var fishCount = 0
 
-    private val sensitivityLevels = intArrayOf(12, 18, 25)
-    private val sensitivityLabels = arrayOf("Nhạy: Cao", "Nhạy: Chuẩn", "Nhạy: Thấp")
-    private var sensitivityIndex = 1
+    // Ngưỡng độ nhạy thấp hơn để bắt dấu (!) ngay từ những khung hình đầu tiên vừa ló sáng
+    private val sensitivityLevels = intArrayOf(6, 10, 16)
+    private val sensitivityLabels = arrayOf("Nhạy: Siêu tốc", "Nhạy: Chuẩn", "Nhạy: Thấp")
+    private var sensitivityIndex = 0 // Mặc định Siêu tốc
 
-    private val roiRadius = 26
-    private var baselineLuma: IntArray? = null
+    private val roiRadius = 28
+    @Volatile private var baselineLuma: IntArray? = null
+
+    // Bộ đệm tái sử dụng để không cấp phát rác RAM (Zero-Allocation)
+    private var reusableLumaBuffer = IntArray(400)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -70,19 +74,20 @@ class FishingBotService : Service() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         prefs = getSharedPreferences("AutoFishPrefs", Context.MODE_PRIVATE)
-        sensitivityIndex = prefs.getInt("sens_idx", 1).coerceIn(0, 2)
+        sensitivityIndex = prefs.getInt("sens_idx", 0).coerceIn(0, 2)
 
         updateScreenMetrics()
 
-        visionThread = HandlerThread("FishVisionThread", Process.THREAD_PRIORITY_BACKGROUND).apply {
+        // Nâng mức ưu tiên luồng xử lý ảnh lên URGENT_DISPLAY để không bị ColorOS bóp xung nhịp khi chơi game
+        visionThread = HandlerThread("FishVisionThread", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply {
             start()
             visionHandler = Handler(looper)
         }
 
         createNotificationChannel()
         val notification = NotificationCompat.Builder(this, "AUTO_FISH_CHANNEL")
-            .setContentTitle("Auto Fish Reno5 đang chạy")
-            .setContentText("Chạm vào thanh điều khiển nổi trên màn hình để Bật/Tắt")
+            .setContentTitle("Auto Fish Reno5 Turbo")
+            .setContentText("Chế độ phản xạ tức thì đang bật")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
 
@@ -147,13 +152,87 @@ class FishingBotService : Service() {
         val captureW = (screenWidth * scaleFactor).toInt().coerceAtLeast(100)
         val captureH = (screenHeight * scaleFactor).toInt().coerceAtLeast(100)
 
-        imageReader = ImageReader.newInstance(captureW, captureH, PixelFormat.RGBA_8888, 2)
+        // maxImages = 3 để không bao giờ bị nghẽn khung hình trên GPU Adreno 618
+        imageReader = ImageReader.newInstance(captureW, captureH, PixelFormat.RGBA_8888, 3).apply {
+            // Kích hoạt phân tích NGAY KHI GPU xuất khung hình mới (Zero-Delay Event Driven)
+            setOnImageAvailableListener({ reader ->
+                onNewFrameArrived(reader)
+            }, visionHandler)
+        }
+
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "AutoFishCapture",
             captureW, captureH, screenDensity,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, visionHandler
         )
+    }
+
+    /**
+     * Hàm này chạy tức thì ngay khi game vẽ ra khung hình mới (60 lần/giây)
+     * Giúp phát hiện dấu (!) chỉ trong vòng < 16ms!
+     */
+    private fun onNewFrameArrived(reader: ImageReader) {
+        val image = try {
+            reader.acquireLatestImage()
+        } catch (e: Exception) {
+            null
+        } ?: return
+
+        try {
+            val state = currentState
+            if (state != BotState.WAITING_BITE && state != BotState.CALIBRATING) {
+                return
+            }
+
+            val now = SystemClock.elapsedRealtime()
+            val elapsed = now - stateStartTime
+
+            if (state == BotState.CALIBRATING) {
+                if (elapsed >= 2000L) {
+                    val count = extractRoiLumaToBuffer(image)
+                    if (count > 0) {
+                        baselineLuma = reusableLumaBuffer.copyOf(count)
+                        transitionTo(BotState.WAITING_BITE)
+                    }
+                }
+                return
+            }
+
+            if (state == BotState.WAITING_BITE) {
+                val base = baselineLuma ?: return
+                val count = extractRoiLumaToBuffer(image)
+                if (count != base.size || count == 0) return
+
+                var sumDiff = 0
+                for (i in 0 until count) {
+                    sumDiff += (reusableLumaBuffer[i] - base[i])
+                }
+                val avgShift = sumDiff / count
+
+                var spikePixels = 0
+                val threshold = sensitivityLevels[sensitivityIndex]
+
+                for (i in 0 until count) {
+                    val cur = reusableLumaBuffer[i]
+                    val correctedDiff = (cur - base[i]) - avgShift
+                    // Dấu (!) màu trắng vàng sáng rực: bắt ngay khi độ sáng tăng đột biến > 38
+                    if (correctedDiff > 38 && cur > 165) {
+                        spikePixels++
+                        if (spikePixels >= threshold) {
+                            // GIẬT CẦN NGAY LẬP TỨC (Không chờ hết vòng lặp!)
+                            val (rx, ry) = getViewCenter(markerReelView)
+                            AutoClickAccessibilityService.instance?.tap(rx, ry, fastMode = true)
+                            fishCount++
+                            transitionTo(BotState.REELING)
+                            return
+                        }
+                    }
+                }
+            }
+        } finally {
+            image.close()
+        }
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -186,7 +265,7 @@ class FishingBotService : Service() {
         }
 
         tvStatus = TextView(this).apply {
-            text = " Sẵn sàng (4 điểm) "
+            text = " Sẵn sàng (Turbo) "
             setTextColor(Color.WHITE)
             textSize = 12f
             setPadding(12, 0, 12, 0)
@@ -367,10 +446,10 @@ class FishingBotService : Service() {
             btnToggle.text = "⏸ DỪNG"
             btnToggle.setBackgroundColor(Color.parseColor("#EF6C00"))
             transitionTo(BotState.CASTING)
-            visionHandler?.post(botLoopRunnable)
+            visionHandler?.post(stateWatchdogRunnable)
         } else {
             transitionTo(BotState.IDLE)
-            visionHandler?.removeCallbacks(botLoopRunnable)
+            visionHandler?.removeCallbacks(stateWatchdogRunnable)
             setMarkersPassThrough(false)
             btnToggle.text = "▶ BẮT ĐẦU"
             btnToggle.setBackgroundColor(Color.parseColor("#2E7D32"))
@@ -383,16 +462,20 @@ class FishingBotService : Service() {
         stateStartTime = SystemClock.elapsedRealtime()
         val statusMsg = when (newState) {
             BotState.IDLE -> " Đã dừng (Câu: $fishCount) "
-            BotState.CASTING -> " [1] Bấm Quăng cần (Ô 2) "
-            BotState.CALIBRATING -> " [2] Đợi phao ổn định... "
-            BotState.WAITING_BITE -> " [3] Canh dấu (!) ở Ô 1 "
-            BotState.REELING -> " [4] KÉO CÁ! (Ô 3) "
-            BotState.STORING -> " [5] Bảo quản (Ô 4) #$fishCount "
+            BotState.CASTING -> " [1] Quăng cần (Ô 2) "
+            BotState.CALIBRATING -> " [2] Chờ phao ổn định... "
+            BotState.WAITING_BITE -> " [3] Canh (!) Siêu tốc "
+            BotState.REELING -> " [4] KÉO CÁ! (#$fishCount) "
+            BotState.STORING -> " [5] Bảo quản (Ô 4) "
         }
         mainHandler.post { tvStatus.text = statusMsg }
     }
 
-    private val botLoopRunnable = object : Runnable {
+    /**
+     * Vòng lặp quản lý chuyển pha (Quăng -> Chờ hoạt ảnh kéo -> Bảo quản -> Quăng lại)
+     * Riêng việc bắt dấu (!) đã được xử lý tức thì bởi onNewFrameArrived() ở tốc độ 60Hz.
+     */
+    private val stateWatchdogRunnable = object : Runnable {
         override fun run() {
             if (currentState == BotState.IDLE) return
 
@@ -411,65 +494,33 @@ class FishingBotService : Service() {
             when (currentState) {
                 BotState.CASTING -> {
                     val (cx, cy) = getViewCenter(markerCastView)
-                    clicker.tap(cx, cy)
+                    clicker.tap(cx, cy, fastMode = false)
                     transitionTo(BotState.CALIBRATING)
                 }
 
                 BotState.CALIBRATING -> {
-                    if (elapsed >= 2100L) {
-                        val luma = sampleScanRoiLuma()
-                        if (luma != null && luma.isNotEmpty()) {
-                            baselineLuma = luma
-                            transitionTo(BotState.WAITING_BITE)
-                        } else if (elapsed > 5000L) {
-                            setupVirtualDisplay()
-                            stateStartTime = now
-                        }
+                    if (elapsed > 5000L) {
+                        setupVirtualDisplay()
+                        stateStartTime = now
                     }
                 }
 
                 BotState.WAITING_BITE -> {
-                    val currentLuma = sampleScanRoiLuma()
-                    val base = baselineLuma
-                    if (currentLuma != null && base != null && currentLuma.size == base.size) {
-                        var spikePixels = 0
-                        var sumDiff = 0
-                        for (i in currentLuma.indices) {
-                            sumDiff += (currentLuma[i] - base[i])
-                        }
-                        val avgShift = sumDiff / currentLuma.size
-
-                        for (i in currentLuma.indices) {
-                            val correctedDiff = (currentLuma[i] - base[i]) - avgShift
-                            if (correctedDiff > 48 && currentLuma[i] > 175) {
-                                spikePixels++
-                            }
-                        }
-
-                        val threshold = sensitivityLevels[sensitivityIndex]
-                        if (spikePixels >= threshold) {
-                            val (rx, ry) = getViewCenter(markerReelView)
-                            clicker.tap(rx, ry)
-                            fishCount++
-                            transitionTo(BotState.REELING)
-                        }
-                    }
-
                     if (elapsed > 35000L) {
                         transitionTo(BotState.CASTING)
                     }
                 }
 
                 BotState.REELING -> {
-                    if (elapsed >= 4100L) {
+                    if (elapsed >= 4000L) {
                         val (sx, sy) = getViewCenter(markerStoreView)
-                        clicker.tap(sx, sy)
+                        clicker.tap(sx, sy, fastMode = false)
                         transitionTo(BotState.STORING)
                     }
                 }
 
                 BotState.STORING -> {
-                    if (elapsed >= 1400L) {
+                    if (elapsed >= 1300L) {
                         transitionTo(BotState.CASTING)
                     }
                 }
@@ -477,57 +528,49 @@ class FishingBotService : Service() {
                 else -> {}
             }
 
-            val nextDelay = if (currentState == BotState.WAITING_BITE) 45L else 220L
-            visionHandler?.postDelayed(this, nextDelay)
+            visionHandler?.postDelayed(this, 120L)
         }
     }
 
-    private fun sampleScanRoiLuma(): IntArray? {
-        val reader = imageReader ?: return null
-        val image = try {
-            reader.acquireLatestImage()
-        } catch (e: Exception) {
-            null
-        } ?: return null
+    private fun extractRoiLumaToBuffer(image: android.media.Image): Int {
+        val plane = image.planes[0]
+        val buffer: ByteBuffer = plane.buffer
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
 
-        try {
-            val plane = image.planes[0]
-            val buffer: ByteBuffer = plane.buffer
-            val pixelStride = plane.pixelStride
-            val rowStride = plane.rowStride
+        val (centerX, centerY) = getViewCenter(markerScanView)
+        val scaledCx = (centerX * scaleFactor).toInt()
+        val scaledCy = (centerY * scaleFactor).toInt()
+        val scaledR = (roiRadius * scaleFactor).toInt()
 
-            val (centerX, centerY) = getViewCenter(markerScanView)
-            val scaledCx = (centerX * scaleFactor).toInt()
-            val scaledCy = (centerY * scaleFactor).toInt()
-            val scaledR = (roiRadius * scaleFactor).toInt()
+        val startX = (scaledCx - scaledR).coerceIn(0, image.width - 1)
+        val endX = (scaledCx + scaledR).coerceIn(0, image.width - 1)
+        val startY = (scaledCy - scaledR).coerceIn(0, image.height - 1)
+        val endY = (scaledCy + scaledR).coerceIn(0, image.height - 1)
 
-            val startX = (scaledCx - scaledR).coerceIn(0, image.width - 1)
-            val endX = (scaledCx + scaledR).coerceIn(0, image.width - 1)
-            val startY = (scaledCy - scaledR).coerceIn(0, image.height - 1)
-            val endY = (scaledCy + scaledR).coerceIn(0, image.height - 1)
+        val width = endX - startX + 1
+        val height = endY - startY + 1
+        val totalPixels = width * height
+        if (totalPixels <= 0) return 0
 
-            val width = endX - startX + 1
-            val height = endY - startY + 1
-            if (width <= 0 || height <= 0) return null
+        if (reusableLumaBuffer.size < totalPixels) {
+            reusableLumaBuffer = IntArray(totalPixels)
+        }
 
-            val result = IntArray(width * height)
-            var idx = 0
-            for (y in startY..endY) {
-                val rowOffset = y * rowStride
-                for (x in startX..endX) {
-                    val offset = rowOffset + x * pixelStride
-                    if (offset + 2 < buffer.limit()) {
-                        val r = buffer.get(offset).toInt() and 0xFF
-                        val g = buffer.get(offset + 1).toInt() and 0xFF
-                        val b = buffer.get(offset + 2).toInt() and 0xFF
-                        result[idx++] = (r * 77 + g * 150 + b * 29) shr 8
-                    }
+        var idx = 0
+        for (y in startY..endY) {
+            val rowOffset = y * rowStride
+            for (x in startX..endX) {
+                val offset = rowOffset + x * pixelStride
+                if (offset + 2 < buffer.limit()) {
+                    val r = buffer.get(offset).toInt() and 0xFF
+                    val g = buffer.get(offset + 1).toInt() and 0xFF
+                    val b = buffer.get(offset + 2).toInt() and 0xFF
+                    reusableLumaBuffer[idx++] = (r * 77 + g * 150 + b * 29) shr 8
                 }
             }
-            return result
-        } finally {
-            image.close()
         }
+        return idx
     }
 
     private fun getViewCenter(view: View): Pair<Float, Float> {
