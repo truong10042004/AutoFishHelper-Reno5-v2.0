@@ -26,10 +26,6 @@ class AutoClickAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    /**
-     * Tối ưu tốc độ nhấn: thời lượng giữ ngón tay 18-28ms (thay vì 55-85ms)
-     * giúp giải phóng hàng đợi cử chỉ ngay lập tức khi kéo cá.
-     */
     fun tap(x: Float, y: Float, fastMode: Boolean = false) {
         val jitterX = x + Random.nextInt(-3, 4)
         val jitterY = y + Random.nextInt(-3, 4)

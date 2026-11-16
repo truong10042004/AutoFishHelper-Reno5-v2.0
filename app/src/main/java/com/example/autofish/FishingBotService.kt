@@ -23,6 +23,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import java.nio.ByteBuffer
+import kotlin.math.abs
 
 class FishingBotService : Service() {
 
@@ -57,16 +58,15 @@ class FishingBotService : Service() {
     @Volatile private var stateStartTime = 0L
     private var fishCount = 0
 
-    // Ngưỡng độ nhạy thấp hơn để bắt dấu (!) ngay từ những khung hình đầu tiên vừa ló sáng
-    private val sensitivityLevels = intArrayOf(6, 10, 16)
+    // Số điểm ảnh biến đổi màu sắc đột biến để kích hoạt giật cần
+    private val sensitivityLevels = intArrayOf(6, 11, 18)
     private val sensitivityLabels = arrayOf("Nhạy: Siêu tốc", "Nhạy: Chuẩn", "Nhạy: Thấp")
-    private var sensitivityIndex = 0 // Mặc định Siêu tốc
+    private var sensitivityIndex = 0
 
-    private val roiRadius = 28
-    @Volatile private var baselineLuma: IntArray? = null
-
-    // Bộ đệm tái sử dụng để không cấp phát rác RAM (Zero-Allocation)
-    private var reusableLumaBuffer = IntArray(400)
+    private val roiRadius = 30
+    // Lưu màu nền RGB đóng gói dạng 0x00RRGGBB
+    @Volatile private var baselineRgb: IntArray? = null
+    private var reusableRgbBuffer = IntArray(1000)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -78,7 +78,6 @@ class FishingBotService : Service() {
 
         updateScreenMetrics()
 
-        // Nâng mức ưu tiên luồng xử lý ảnh lên URGENT_DISPLAY để không bị ColorOS bóp xung nhịp khi chơi game
         visionThread = HandlerThread("FishVisionThread", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply {
             start()
             visionHandler = Handler(looper)
@@ -86,8 +85,8 @@ class FishingBotService : Service() {
 
         createNotificationChannel()
         val notification = NotificationCompat.Builder(this, "AUTO_FISH_CHANNEL")
-            .setContentTitle("Auto Fish Reno5 Turbo")
-            .setContentText("Chế độ phản xạ tức thì đang bật")
+            .setContentTitle("Auto Fish Reno5 Đa Sắc")
+            .setContentText("Nhận diện mọi màu dấu (!)")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
 
@@ -152,9 +151,7 @@ class FishingBotService : Service() {
         val captureW = (screenWidth * scaleFactor).toInt().coerceAtLeast(100)
         val captureH = (screenHeight * scaleFactor).toInt().coerceAtLeast(100)
 
-        // maxImages = 3 để không bao giờ bị nghẽn khung hình trên GPU Adreno 618
         imageReader = ImageReader.newInstance(captureW, captureH, PixelFormat.RGBA_8888, 3).apply {
-            // Kích hoạt phân tích NGAY KHI GPU xuất khung hình mới (Zero-Delay Event Driven)
             setOnImageAvailableListener({ reader ->
                 onNewFrameArrived(reader)
             }, visionHandler)
@@ -169,8 +166,8 @@ class FishingBotService : Service() {
     }
 
     /**
-     * Hàm này chạy tức thì ngay khi game vẽ ra khung hình mới (60 lần/giây)
-     * Giúp phát hiện dấu (!) chỉ trong vòng < 16ms!
+     * So sánh khoảng cách màu đa kênh (RGB Color Distance) thay vì chỉ đo độ sáng:
+     * Bắt được mọi màu dấu (!): Trắng, Vàng, Đỏ, Hồng, Tím, Xanh dương, Xanh ngọc, Cầu vồng...
      */
     private fun onNewFrameArrived(reader: ImageReader) {
         val image = try {
@@ -190,9 +187,9 @@ class FishingBotService : Service() {
 
             if (state == BotState.CALIBRATING) {
                 if (elapsed >= 2000L) {
-                    val count = extractRoiLumaToBuffer(image)
+                    val count = extractRoiRgbToBuffer(image)
                     if (count > 0) {
-                        baselineLuma = reusableLumaBuffer.copyOf(count)
+                        baselineRgb = reusableRgbBuffer.copyOf(count)
                         transitionTo(BotState.WAITING_BITE)
                     }
                 }
@@ -200,27 +197,43 @@ class FishingBotService : Service() {
             }
 
             if (state == BotState.WAITING_BITE) {
-                val base = baselineLuma ?: return
-                val count = extractRoiLumaToBuffer(image)
+                val base = baselineRgb ?: return
+                val count = extractRoiRgbToBuffer(image)
                 if (count != base.size || count == 0) return
 
-                var sumDiff = 0
+                // Tính độ trôi màu nền trung bình (do mây trôi, sóng nước lăn tăn hoặc chuyển ngày/đêm)
+                var sumDr = 0
+                var sumDg = 0
+                var sumDb = 0
                 for (i in 0 until count) {
-                    sumDiff += (reusableLumaBuffer[i] - base[i])
+                    val cur = reusableRgbBuffer[i]
+                    val ref = base[i]
+                    sumDr += ((cur shr 16) and 0xFF) - ((ref shr 16) and 0xFF)
+                    sumDg += ((cur shr 8) and 0xFF) - ((ref shr 8) and 0xFF)
+                    sumDb += (cur and 0xFF) - (ref and 0xFF)
                 }
-                val avgShift = sumDiff / count
+                val avgDr = sumDr / count
+                val avgDg = sumDg / count
+                val avgDb = sumDb / count
 
-                var spikePixels = 0
+                var changedPixels = 0
                 val threshold = sensitivityLevels[sensitivityIndex]
 
                 for (i in 0 until count) {
-                    val cur = reusableLumaBuffer[i]
-                    val correctedDiff = (cur - base[i]) - avgShift
-                    // Dấu (!) màu trắng vàng sáng rực: bắt ngay khi độ sáng tăng đột biến > 38
-                    if (correctedDiff > 38 && cur > 165) {
-                        spikePixels++
-                        if (spikePixels >= threshold) {
-                            // GIẬT CẦN NGAY LẬP TỨC (Không chờ hết vòng lặp!)
+                    val cur = reusableRgbBuffer[i]
+                    val ref = base[i]
+
+                    val dr = abs(((cur shr 16) and 0xFF) - ((ref shr 16) and 0xFF) - avgDr)
+                    val dg = abs(((cur shr 8) and 0xFF) - ((ref shr 8) and 0xFF) - avgDg)
+                    val db = abs((cur and 0xFF) - (ref and 0xFF) - avgDb)
+
+                    // Tổng sai khác 3 kênh màu (Manhattan RGB distance) hoặc có 1 kênh bứt phá mạnh (đỏ rực, tím rực, trắng sáng)
+                    val colorDelta = dr + dg + db
+                    val maxChannelJump = maxOf(dr, maxOf(dg, db))
+
+                    if (colorDelta > 95 || maxChannelJump > 48) {
+                        changedPixels++
+                        if (changedPixels >= threshold) {
                             val (rx, ry) = getViewCenter(markerReelView)
                             AutoClickAccessibilityService.instance?.tap(rx, ry, fastMode = true)
                             fishCount++
@@ -265,7 +278,7 @@ class FishingBotService : Service() {
         }
 
         tvStatus = TextView(this).apply {
-            text = " Sẵn sàng (Turbo) "
+            text = " Sẵn sàng (Đa sắc) "
             setTextColor(Color.WHITE)
             textSize = 12f
             setPadding(12, 0, 12, 0)
@@ -464,17 +477,13 @@ class FishingBotService : Service() {
             BotState.IDLE -> " Đã dừng (Câu: $fishCount) "
             BotState.CASTING -> " [1] Quăng cần (Ô 2) "
             BotState.CALIBRATING -> " [2] Chờ phao ổn định... "
-            BotState.WAITING_BITE -> " [3] Canh (!) Siêu tốc "
+            BotState.WAITING_BITE -> " [3] Canh (!) Đa sắc "
             BotState.REELING -> " [4] KÉO CÁ! (#$fishCount) "
             BotState.STORING -> " [5] Bảo quản (Ô 4) "
         }
         mainHandler.post { tvStatus.text = statusMsg }
     }
 
-    /**
-     * Vòng lặp quản lý chuyển pha (Quăng -> Chờ hoạt ảnh kéo -> Bảo quản -> Quăng lại)
-     * Riêng việc bắt dấu (!) đã được xử lý tức thì bởi onNewFrameArrived() ở tốc độ 60Hz.
-     */
     private val stateWatchdogRunnable = object : Runnable {
         override fun run() {
             if (currentState == BotState.IDLE) return
@@ -532,7 +541,7 @@ class FishingBotService : Service() {
         }
     }
 
-    private fun extractRoiLumaToBuffer(image: android.media.Image): Int {
+    private fun extractRoiRgbToBuffer(image: android.media.Image): Int {
         val plane = image.planes[0]
         val buffer: ByteBuffer = plane.buffer
         val pixelStride = plane.pixelStride
@@ -553,8 +562,8 @@ class FishingBotService : Service() {
         val totalPixels = width * height
         if (totalPixels <= 0) return 0
 
-        if (reusableLumaBuffer.size < totalPixels) {
-            reusableLumaBuffer = IntArray(totalPixels)
+        if (reusableRgbBuffer.size < totalPixels) {
+            reusableRgbBuffer = IntArray(totalPixels)
         }
 
         var idx = 0
@@ -566,7 +575,7 @@ class FishingBotService : Service() {
                     val r = buffer.get(offset).toInt() and 0xFF
                     val g = buffer.get(offset + 1).toInt() and 0xFF
                     val b = buffer.get(offset + 2).toInt() and 0xFF
-                    reusableLumaBuffer[idx++] = (r * 77 + g * 150 + b * 29) shr 8
+                    reusableRgbBuffer[idx++] = (r shl 16) or (g shl 8) or b
                 }
             }
         }
