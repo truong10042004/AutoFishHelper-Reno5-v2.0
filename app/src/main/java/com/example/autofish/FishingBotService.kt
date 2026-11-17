@@ -51,6 +51,7 @@ class FishingBotService : Service() {
 
     private lateinit var btnToggle: Button
     private lateinit var btnSensitivity: Button
+    private lateinit var btnReelMode: Button
     private lateinit var tvStatus: TextView
 
     private enum class BotState { IDLE, CASTING, CALIBRATING, WAITING_BITE, REELING, STORING }
@@ -58,15 +59,28 @@ class FishingBotService : Service() {
     @Volatile private var stateStartTime = 0L
     private var fishCount = 0
 
-    // Số điểm ảnh biến đổi màu sắc đột biến để kích hoạt giật cần
+    // Độ nhạy nhận diện dấu (!)
     private val sensitivityLevels = intArrayOf(6, 11, 18)
     private val sensitivityLabels = arrayOf("Nhạy: Siêu tốc", "Nhạy: Chuẩn", "Nhạy: Thấp")
     private var sensitivityIndex = 0
 
-    private val roiRadius = 30
-    // Lưu màu nền RGB đóng gói dạng 0x00RRGGBB
+    // Chế độ thời gian kéo cá:
+    // 0: Tự động thông minh (chờ tới khi nút Bảo quản xuất hiện, tối đa 10.5 giây)
+    // 1: Cố định 7.5 giây
+    // 2: Cố định 9.5 giây
+    private val reelModeLabels = arrayOf("Kéo: Tự động", "Kéo: 7.5s", "Kéo: 9.5s")
+    private val reelMaxTimeouts = longArrayOf(10500L, 7500L, 9500L)
+    private var reelModeIndex = 0
+
+    private val scanRoiRadius = 30
+    private val storeRoiRadius = 22
+
     @Volatile private var baselineRgb: IntArray? = null
-    private var reusableRgbBuffer = IntArray(1000)
+    @Volatile private var storeBaselineRgb: IntArray? = null
+    @Volatile private var storeDetectStreak = 0
+    @Volatile private var storeAppearedAt = 0L
+
+    private var reusableRgbBuffer = IntArray(1200)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -75,6 +89,7 @@ class FishingBotService : Service() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         prefs = getSharedPreferences("AutoFishPrefs", Context.MODE_PRIVATE)
         sensitivityIndex = prefs.getInt("sens_idx", 0).coerceIn(0, 2)
+        reelModeIndex = prefs.getInt("reel_idx", 0).coerceIn(0, 2)
 
         updateScreenMetrics()
 
@@ -85,8 +100,8 @@ class FishingBotService : Service() {
 
         createNotificationChannel()
         val notification = NotificationCompat.Builder(this, "AUTO_FISH_CHANNEL")
-            .setContentTitle("Auto Fish Reno5 Đa Sắc")
-            .setContentText("Nhận diện mọi màu dấu (!)")
+            .setContentTitle("Auto Fish Reno5 Cá Hiếm")
+            .setContentText("Đang chạy nhận diện thông minh")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
 
@@ -166,8 +181,10 @@ class FishingBotService : Service() {
     }
 
     /**
-     * So sánh khoảng cách màu đa kênh (RGB Color Distance) thay vì chỉ đo độ sáng:
-     * Bắt được mọi màu dấu (!): Trắng, Vàng, Đỏ, Hồng, Tím, Xanh dương, Xanh ngọc, Cầu vồng...
+     * Xử lý khung hình tức thì ở tần số quét màn hình:
+     * 1. Trong pha CALIBRATING/WAITING_BITE: theo dõi dấu (!) đa sắc trên đầu nhân vật (Ô 1).
+     * 2. Trong pha REELING: theo dõi khi nút "Bảo quản" (Ô 4) xuất hiện để không cắt ngang
+     *    quá trình kéo cá hiếm nhưng vẫn bấm cất ngay khi cá thường vừa lên bờ!
      */
     private fun onNewFrameArrived(reader: ImageReader) {
         val image = try {
@@ -178,7 +195,7 @@ class FishingBotService : Service() {
 
         try {
             val state = currentState
-            if (state != BotState.WAITING_BITE && state != BotState.CALIBRATING) {
+            if (state == BotState.IDLE || state == BotState.CASTING || state == BotState.STORING) {
                 return
             }
 
@@ -187,7 +204,7 @@ class FishingBotService : Service() {
 
             if (state == BotState.CALIBRATING) {
                 if (elapsed >= 2000L) {
-                    val count = extractRoiRgbToBuffer(image)
+                    val count = extractMarkerRgbToBuffer(image, markerScanView, scanRoiRadius)
                     if (count > 0) {
                         baselineRgb = reusableRgbBuffer.copyOf(count)
                         transitionTo(BotState.WAITING_BITE)
@@ -198,10 +215,9 @@ class FishingBotService : Service() {
 
             if (state == BotState.WAITING_BITE) {
                 val base = baselineRgb ?: return
-                val count = extractRoiRgbToBuffer(image)
+                val count = extractMarkerRgbToBuffer(image, markerScanView, scanRoiRadius)
                 if (count != base.size || count == 0) return
 
-                // Tính độ trôi màu nền trung bình (do mây trôi, sóng nước lăn tăn hoặc chuyển ngày/đêm)
                 var sumDr = 0
                 var sumDg = 0
                 var sumDb = 0
@@ -227,7 +243,6 @@ class FishingBotService : Service() {
                     val dg = abs(((cur shr 8) and 0xFF) - ((ref shr 8) and 0xFF) - avgDg)
                     val db = abs((cur and 0xFF) - (ref and 0xFF) - avgDb)
 
-                    // Tổng sai khác 3 kênh màu (Manhattan RGB distance) hoặc có 1 kênh bứt phá mạnh (đỏ rực, tím rực, trắng sáng)
                     val colorDelta = dr + dg + db
                     val maxChannelJump = maxOf(dr, maxOf(dg, db))
 
@@ -237,10 +252,65 @@ class FishingBotService : Service() {
                             val (rx, ry) = getViewCenter(markerReelView)
                             AutoClickAccessibilityService.instance?.tap(rx, ry, fastMode = true)
                             fishCount++
+                            storeBaselineRgb = null
+                            storeDetectStreak = 0
+                            storeAppearedAt = 0L
                             transitionTo(BotState.REELING)
                             return
                         }
                     }
+                }
+                return
+            }
+
+            // Pha REELING: Tự động nhận diện khi nút "Bảo quản" (Ô 4) bật lên
+            if (state == BotState.REELING && reelModeIndex == 0) {
+                // Sau 1.0 giây (lúc nhân vật đang kéo dưới nước, bảng Bảo quản chưa hiện), lấy mẫu nền tại Ô 4
+                if (storeBaselineRgb == null && elapsed in 1000L..2500L) {
+                    val count = extractMarkerRgbToBuffer(image, markerStoreView, storeRoiRadius)
+                    if (count > 0) {
+                        storeBaselineRgb = reusableRgbBuffer.copyOf(count)
+                    }
+                    return
+                }
+
+                // Bắt đầu kiểm tra bảng Bảo quản xuất hiện từ mốc 3.3 giây trở đi
+                val storeBase = storeBaselineRgb ?: return
+                if (elapsed < 3300L) return
+
+                if (storeAppearedAt > 0L) {
+                    // Đợi thêm 350ms sau khi bảng vừa trượt ra để hiệu ứng ổn định rồi bấm Bảo quản
+                    if (now - storeAppearedAt >= 350L) {
+                        val (sx, sy) = getViewCenter(markerStoreView)
+                        AutoClickAccessibilityService.instance?.tap(sx, sy, fastMode = false)
+                        transitionTo(BotState.STORING)
+                    }
+                    return
+                }
+
+                val count = extractMarkerRgbToBuffer(image, markerStoreView, storeRoiRadius)
+                if (count != storeBase.size || count == 0) return
+
+                var changedStorePixels = 0
+                for (i in 0 until count) {
+                    val cur = reusableRgbBuffer[i]
+                    val ref = storeBase[i]
+                    val dr = abs(((cur shr 16) and 0xFF) - ((ref shr 16) and 0xFF))
+                    val dg = abs(((cur shr 8) and 0xFF) - ((ref shr 8) and 0xFF))
+                    val db = abs((cur and 0xFF) - (ref and 0xFF))
+                    if (dr + dg + db > 75 || maxOf(dr, maxOf(dg, db)) > 38) {
+                        changedStorePixels++
+                    }
+                }
+
+                // Nếu hơn 45% diện tích vùng Ô 4 đổi sang màu nút "Bảo quản"
+                if (changedStorePixels >= (count * 45) / 100) {
+                    storeDetectStreak++
+                    if (storeDetectStreak >= 6) {
+                        storeAppearedAt = now
+                    }
+                } else {
+                    storeDetectStreak = 0
                 }
             }
         } finally {
@@ -253,13 +323,13 @@ class FishingBotService : Service() {
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#E61A1A1A"))
-            setPadding(16, 10, 16, 10)
+            setPadding(14, 8, 14, 8)
             gravity = Gravity.CENTER_VERTICAL
         }
 
         btnToggle = Button(this).apply {
             text = "▶ BẮT ĐẦU"
-            textSize = 12f
+            textSize = 11f
             setBackgroundColor(Color.parseColor("#2E7D32"))
             setTextColor(Color.WHITE)
             setOnClickListener { toggleBot() }
@@ -267,7 +337,7 @@ class FishingBotService : Service() {
 
         btnSensitivity = Button(this).apply {
             text = sensitivityLabels[sensitivityIndex]
-            textSize = 11f
+            textSize = 10f
             setBackgroundColor(Color.parseColor("#37474F"))
             setTextColor(Color.WHITE)
             setOnClickListener {
@@ -277,16 +347,28 @@ class FishingBotService : Service() {
             }
         }
 
-        tvStatus = TextView(this).apply {
-            text = " Sẵn sàng (Đa sắc) "
+        btnReelMode = Button(this).apply {
+            text = reelModeLabels[reelModeIndex]
+            textSize = 10f
+            setBackgroundColor(Color.parseColor("#00695C"))
             setTextColor(Color.WHITE)
-            textSize = 12f
-            setPadding(12, 0, 12, 0)
+            setOnClickListener {
+                reelModeIndex = (reelModeIndex + 1) % reelModeLabels.size
+                text = reelModeLabels[reelModeIndex]
+                prefs.edit().putInt("reel_idx", reelModeIndex).apply()
+            }
+        }
+
+        tvStatus = TextView(this).apply {
+            text = " Sẵn sàng "
+            setTextColor(Color.WHITE)
+            textSize = 11f
+            setPadding(10, 0, 10, 0)
         }
 
         val btnClose = Button(this).apply {
             text = "✕"
-            textSize = 12f
+            textSize = 11f
             setBackgroundColor(Color.parseColor("#C62828"))
             setTextColor(Color.WHITE)
             setOnClickListener { stopSelf() }
@@ -294,13 +376,14 @@ class FishingBotService : Service() {
 
         panel.addView(btnToggle)
         panel.addView(btnSensitivity)
+        panel.addView(btnReelMode)
         panel.addView(tvStatus)
         panel.addView(btnClose)
         controlPanelView = panel
 
         val panelParams = createOverlayParams(
-            prefs.getInt("panel_x", 40),
-            prefs.getInt("panel_y", 30)
+            prefs.getInt("panel_x", 30),
+            prefs.getInt("panel_y", 25)
         )
         windowManager.addView(controlPanelView, panelParams)
         makeDraggable(controlPanelView, panelParams, "panel")
@@ -521,7 +604,17 @@ class FishingBotService : Service() {
                 }
 
                 BotState.REELING -> {
-                    if (elapsed >= 4000L) {
+                    val maxWait = reelMaxTimeouts[reelModeIndex]
+                    val secText = String.format("%.1fs", elapsed / 1000.0)
+                    mainHandler.post {
+                        if (currentState == BotState.REELING) {
+                            tvStatus.text = " [4] Đang kéo ($secText)... "
+                        }
+                    }
+
+                    // Nếu đạt thời gian tối đa (10.5s ở chế độ Tự động, hoặc 7.5s / 9.5s ở chế độ cố định)
+                    // thì thực hiện bấm Bảo quản để đảm bảo không bao giờ kẹt vòng lặp
+                    if (elapsed >= maxWait) {
                         val (sx, sy) = getViewCenter(markerStoreView)
                         clicker.tap(sx, sy, fastMode = false)
                         transitionTo(BotState.STORING)
@@ -529,7 +622,8 @@ class FishingBotService : Service() {
                 }
 
                 BotState.STORING -> {
-                    if (elapsed >= 1300L) {
+                    // Đợi 1.6 giây để bảng thông tin cá (kể cả cá hiếm có huy hiệu NEW) đóng hẳn
+                    if (elapsed >= 1600L) {
                         transitionTo(BotState.CASTING)
                     }
                 }
@@ -537,20 +631,20 @@ class FishingBotService : Service() {
                 else -> {}
             }
 
-            visionHandler?.postDelayed(this, 120L)
+            visionHandler?.postDelayed(this, 150L)
         }
     }
 
-    private fun extractRoiRgbToBuffer(image: android.media.Image): Int {
+    private fun extractMarkerRgbToBuffer(image: android.media.Image, markerView: View, radiusPx: Int): Int {
         val plane = image.planes[0]
         val buffer: ByteBuffer = plane.buffer
         val pixelStride = plane.pixelStride
         val rowStride = plane.rowStride
 
-        val (centerX, centerY) = getViewCenter(markerScanView)
+        val (centerX, centerY) = getViewCenter(markerView)
         val scaledCx = (centerX * scaleFactor).toInt()
         val scaledCy = (centerY * scaleFactor).toInt()
-        val scaledR = (roiRadius * scaleFactor).toInt()
+        val scaledR = (radiusPx * scaleFactor).toInt()
 
         val startX = (scaledCx - scaledR).coerceIn(0, image.width - 1)
         val endX = (scaledCx + scaledR).coerceIn(0, image.width - 1)

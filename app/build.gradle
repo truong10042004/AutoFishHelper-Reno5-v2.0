@@ -11,8 +11,8 @@ android {
         applicationId "com.example.autofish"
         minSdk 26
         targetSdk 30
-        versionCode 5
-        versionName "2.2-AllColors"
+        versionCode 6
+        versionName "2.3-RareFish"
     }
 
     buildTypes {

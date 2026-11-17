@@ -33,7 +33,7 @@ class AutoClickAccessibilityService : AccessibilityService() {
         val path = Path().apply {
             moveTo(jitterX.coerceAtLeast(1f), jitterY.coerceAtLeast(1f))
         }
-        val duration = if (fastMode) Random.nextLong(16L, 26L) else Random.nextLong(35L, 50L)
+        val duration = if (fastMode) Random.nextLong(16L, 26L) else Random.nextLong(35L, 52L)
         val stroke = GestureDescription.StrokeDescription(path, 0L, duration)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         dispatchGesture(gesture, null, null)

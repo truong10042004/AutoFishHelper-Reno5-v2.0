@@ -42,7 +42,7 @@ class MainActivity : AppCompatActivity() {
             }
             moveTaskToBack(true)
         } else {
-            Toast.makeText(this, "Cần bấm 'Bắt đầu ngay' để nhận diện dấu (!)", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Cần bấm 'Bắt đầu ngay' để nhận diện màn hình", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -58,14 +58,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Auto Câu Cá v2.2 Đa Sắc (Reno5)"
+            text = "Auto Câu Cá v2.3 Cá Hiếm (Reno5)"
             textSize = 20f
             setTextColor(Color.WHITE)
             setPadding(0, 0, 0, 16)
         }
 
         val subTitle = TextView(this).apply {
-            text = "Nhận diện mọi màu dấu (!) (Đỏ, Tím, Xanh, Vàng, Trắng...):\n- Phân tích đồng thời độ sáng + 3 kênh màu RGB\n- Phản xạ tức thì dưới 16ms"
+            text = "Nâng cấp bắt trọn cá hiếm & cá khổng lồ:\n- Tự động nhận diện khi nút 'Bảo quản' (Ô 4) hiện lên\n- Kéo cá thường nhanh (~3.8s), tự chờ cá hiếm tới 10s"
             textSize = 13f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 36)
