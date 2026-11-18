@@ -58,14 +58,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Auto Câu Cá v2.3 Cá Hiếm (Reno5)"
+            text = "Auto Câu Cá v2.4 (OPPO Reno5)"
             textSize = 20f
             setTextColor(Color.WHITE)
             setPadding(0, 0, 0, 16)
         }
 
         val subTitle = TextView(this).apply {
-            text = "Nâng cấp bắt trọn cá hiếm & cá khổng lồ:\n- Tự động nhận diện khi nút 'Bảo quản' (Ô 4) hiện lên\n- Kéo cá thường nhanh (~3.8s), tự chờ cá hiếm tới 10s"
+            text = "Cập nhật v2.4 tối ưu treo máy:\n- Tăng thời gian chờ cá cắn lên 60 giây\n- Tự làm mới nền mỗi 1.2s chống giật nhầm khi cá rỉa lâu\n- Tự động nhận diện nút 'Bảo quản' cho cá hiếm"
             textSize = 13f
             setTextColor(Color.LTGRAY)
             setPadding(0, 0, 0, 36)

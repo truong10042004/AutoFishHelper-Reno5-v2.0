@@ -76,6 +76,8 @@ class FishingBotService : Service() {
     private val storeRoiRadius = 22
 
     @Volatile private var baselineRgb: IntArray? = null
+    @Volatile private var lastBaselineRefreshAt = 0L
+    @Volatile private var biteDetectStreak = 0
     @Volatile private var storeBaselineRgb: IntArray? = null
     @Volatile private var storeDetectStreak = 0
     @Volatile private var storeAppearedAt = 0L
@@ -207,6 +209,8 @@ class FishingBotService : Service() {
                     val count = extractMarkerRgbToBuffer(image, markerScanView, scanRoiRadius)
                     if (count > 0) {
                         baselineRgb = reusableRgbBuffer.copyOf(count)
+                        lastBaselineRefreshAt = now
+                        biteDetectStreak = 0
                         transitionTo(BotState.WAITING_BITE)
                     }
                 }
@@ -246,18 +250,34 @@ class FishingBotService : Service() {
                     val colorDelta = dr + dg + db
                     val maxChannelJump = maxOf(dr, maxOf(dg, db))
 
-                    if (colorDelta > 95 || maxChannelJump > 48) {
+                    if (colorDelta > 98 || maxChannelJump > 50) {
                         changedPixels++
-                        if (changedPixels >= threshold) {
-                            val (rx, ry) = getViewCenter(markerReelView)
-                            AutoClickAccessibilityService.instance?.tap(rx, ry, fastMode = true)
-                            fishCount++
-                            storeBaselineRgb = null
-                            storeDetectStreak = 0
-                            storeAppearedAt = 0L
-                            transitionTo(BotState.REELING)
-                            return
+                    }
+                }
+
+                if (changedPixels >= threshold) {
+                    biteDetectStreak++
+                    // Xác nhận 2 khung hình liên tiếp (~32ms) để loại bỏ nhiễu bọt nước khi cá rỉa
+                    if (biteDetectStreak >= 2) {
+                        val (rx, ry) = getViewCenter(markerReelView)
+                        AutoClickAccessibilityService.instance?.tap(rx, ry, fastMode = true)
+                        fishCount++
+                        biteDetectStreak = 0
+                        storeBaselineRgb = null
+                        storeDetectStreak = 0
+                        storeAppearedAt = 0L
+                        transitionTo(BotState.REELING)
+                        return
+                    }
+                } else {
+                    biteDetectStreak = 0
+                    // Tự cập nhật mẫu nền mỗi 1.2 giây nếu vùng Ô 1 đang yên tĩnh,
+                    // giúp chống trôi màu trời/nước trong suốt 60 giây chờ cá rỉa mồi
+                    if (changedPixels <= (threshold / 2) && (now - lastBaselineRefreshAt >= 1200L)) {
+                        for (i in 0 until count) {
+                            base[i] = reusableRgbBuffer[i]
                         }
+                        lastBaselineRefreshAt = now
                     }
                 }
                 return
@@ -598,7 +618,13 @@ class FishingBotService : Service() {
                 }
 
                 BotState.WAITING_BITE -> {
-                    if (elapsed > 35000L) {
+                    val waitSec = (elapsed / 1000L).toInt()
+                    mainHandler.post {
+                        if (currentState == BotState.WAITING_BITE) {
+                            tvStatus.text = " [3] Canh (!) ${waitSec}s/60s "
+                        }
+                    }
+                    if (elapsed >= 60000L) {
                         transitionTo(BotState.CASTING)
                     }
                 }
